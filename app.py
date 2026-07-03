@@ -2,18 +2,32 @@ import os
 import sqlite3
 import datetime
 import pandas as pd
-import requests
 from flask import Flask, render_template, request, jsonify
+from dotenv import load_dotenv  
+from google import genai
+from google.genai import types
 
-app = Flask(__name__, template_folder='template')
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge_capture.db")
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "llama3:latest"
+# 1. Establish absolute directory path structures
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 2. Force load the .env file explicitly using its absolute location
+dotenv_path = os.path.join(BASE_DIR, '.env')
+load_dotenv(dotenv_path=dotenv_path)
+
+# 3. Explicitly wire the template_folder configuration using absolute paths
+app = Flask(
+    __name__, 
+    template_folder=os.path.join(BASE_DIR, 'template')
+)
+DB_FILE = os.path.join(BASE_DIR, "knowledge_capture.db")
+
+# 4. Initialize the official Gemini Client
+# It will now easily locate the GEMINI_API_KEY from the explicitly loaded environment
+client = genai.Client()
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # Updated table schema with all specific form questions
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS responses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,15 +38,21 @@ def init_db():
             detailed_desc TEXT,
             troubleshooting_steps TEXT,
             resolution TEXT,
-            status TEXT
+            status TEXT,
+            image_base64 TEXT
         )
     ''')
     conn.commit()
     conn.close()
 
-def get_recent_data_summary(limit=10):
+def get_recent_data_summary(limit=12):
     conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query(f"SELECT * FROM responses ORDER BY id DESC LIMIT {limit}", conn)
+    # Exclude base64 image strings to prevent feeding massive content to the LLM token window
+    df = pd.read_sql_query(
+        f"SELECT id, timestamp, name, target_task, category, detailed_desc, troubleshooting_steps, resolution, status "
+        f"FROM responses ORDER BY id DESC LIMIT {limit}", 
+        conn
+    )
     conn.close()
     return df.to_string(index=False)
 
@@ -56,6 +76,7 @@ def add_new_log():
         troubleshooting_steps = data.get("troubleshooting_steps", "")
         resolution = data.get("resolution", "")
         status = data.get("status", "Pending")
+        image_base64 = data.get("image_base64", "")
         
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
@@ -65,9 +86,9 @@ def add_new_log():
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO responses (timestamp, name, target_task, category, detailed_desc, troubleshooting_steps, resolution, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (timestamp, name, target_task, category, detailed_desc, troubleshooting_steps, resolution, status))
+            INSERT INTO responses (timestamp, name, target_task, category, detailed_desc, troubleshooting_steps, resolution, status, image_base64)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (timestamp, name, target_task, category, detailed_desc, troubleshooting_steps, resolution, status, image_base64))
         conn.commit()
         conn.close()
         
@@ -77,29 +98,33 @@ def add_new_log():
 
 @app.route('/api/chat', methods=['POST'])
 def chat_with_ai():
-    user_query = request.json.get("query", "")
-    current_data_context = get_recent_data_summary(limit=10)
-    
-    combined_prompt = (
-        "Instructions: You are an expert operations assistant. Look at the comprehensive tracking data breakdown snapshot below "
-        "and answer the user's question directly based on tasks, troubleshooting data, and resolution descriptions.\n\n"
-        f"--- LIVE DETAILED SNAPSHOT ---\n{current_data_context}\n---------------------------\n\n"
-        f"User Question: {user_query}\n\n"
-        "Response:"
-    )
-    
-    payload = {
-        "model": MODEL_NAME,
-        "prompt": combined_prompt,
-        "stream": False,
-        "options": {"temperature": 0.3}
-    }
-    
     try:
-        response = requests.post(OLLAMA_URL, json=payload)
-        return jsonify({"reply": response.json().get("response", "No response generated.")})
+        user_query = request.json.get("query", "")
+        current_data_context = get_recent_data_summary(limit=12)
+        
+        system_instruction = (
+            "You are an expert operations assistant. Look at the comprehensive tracking data breakdown snapshot below "
+            "and answer the user's question directly based on tasks, troubleshooting data, and resolution descriptions."
+        )
+        
+        prompt_content = (
+            f"--- LIVE TRACKER DATA SNAPSHOT ---\n{current_data_context}\n----------------------------------\n\n"
+            f"User Question: {user_query}"
+        )
+        
+        # Request generation using the high-speed, free-tier gemini-2.5-flash model
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt_content,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.2,
+            ),
+        )
+        
+        return jsonify({"reply": response.text})
     except Exception as e:
-        return jsonify({"reply": f"Error communicating with local AI model: {str(e)}"}), 500
+        return jsonify({"reply": f"Cloud Core Error Processing Request: {str(e)}"}), 500
 
 init_db()
 
